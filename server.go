@@ -2,6 +2,7 @@ package dht
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"github.com/anacrolix/dht/v2/int160"
 	"github.com/anacrolix/dht/v2/krpc"
 	peer_store "github.com/anacrolix/dht/v2/peer-store"
+	"github.com/anacrolix/dht/v2/store"
 	"github.com/anacrolix/dht/v2/traversal"
 	"github.com/anacrolix/dht/v2/types"
 )
@@ -156,6 +158,8 @@ func NewDefaultServerConfig() *ServerConfig {
 		NoSecurity:    true,
 		StartingNodes: func() ([]Addr, error) { return GlobalBootstrapAddrs("udp") },
 		DefaultWant:   []krpc.Want{krpc.WantNodes, krpc.WantNodes6},
+		Store:         store.NewMemory(),
+		MaxValueSize:  1000,
 	}
 }
 
@@ -526,6 +530,52 @@ func (s *Server) handleQuery(source Addr, m krpc.Msg) {
 		}
 
 		s.reply(source, m.T, krpc.Return{})
+	case "put":
+		if !s.validToken(args.Token, source) {
+			expvars.Add("received put with invalid token", 1)
+			return
+		}
+		expvars.Add("received put with valid token", 1)
+		si := &store.Item{
+			Target: args.Target,
+			V:      args.V,
+			K:      args.K,
+			Cas:    args.Cas,
+			Seq:    args.Seq,
+			Sig:    args.Sig,
+		}
+		if err := s.config.Store.Put(si); err != nil {
+			s.sendError(source, m.T, krpc.Error{
+				Code: krpc.ErrorCodeGenericError,
+				Msg:  "error storing data from put request",
+			})
+			break
+		}
+		s.reply(source, m.T, krpc.Return{})
+	case "get":
+		var r krpc.Return
+		if err := s.setReturnNodes(&r, m, source); err != nil {
+			s.sendError(source, m.T, *err)
+			break
+		}
+		r.Token = func() *string {
+			t := s.createToken(source)
+			return &t
+		}()
+		item, err := s.config.Store.Get(store.Target(args.Target))
+		if err != nil {
+			s.sendError(source, m.T, krpc.Error{
+				Code: krpc.ErrorCodeGenericError,
+				Msg:  "error storing data from get request",
+			})
+			break
+		}
+		r.V = item.V
+		r.K = item.K
+		r.Seq = item.Seq
+		r.Sig = item.Sig
+
+		s.reply(source, m.T, r)
 	//case "sample_infohashes":
 	//// Nodes supporting this extension should always include the samples field in the response,
 	//// even when it is zero-length. This lets indexing nodes to distinguish nodes supporting this
@@ -918,6 +968,38 @@ func (s *Server) Ping(node *net.UDPAddr) QueryResult {
 	return res
 }
 
+func (s *Server) Put(ctx context.Context, node Addr, value []byte, salt []byte, k ed25519.PrivateKey, rl QueryRateLimiting) QueryResult {
+	i := &store.Item{
+		V:    value,
+		Salt: salt,
+	}
+
+	if err := i.Calc(k, s.config.MaxValueSize); err != nil {
+		return err
+	}
+
+	if err := i.Check(); err != nil {
+		return err
+	}
+
+	return s.Query(ctx, node, "put", QueryInput{
+		MsgArgs: krpc.MsgArgs{
+			Target: i.Target,
+			V:      i.V,
+			K:      i.K,
+			Sig:    i.Sig,
+			Seq:    i.Seq,
+			Cas:    i.Cas,
+			Salt:   i.Salt,
+		},
+	})
+	return s.query(node, "put", &krpc.MsgArgs{
+		Token: token,
+	}, func(m krpc.Msg, err error) {
+		//					fmt.Printf("put %v\n",m.Error())
+	})
+}
+
 func (s *Server) announcePeer(node Addr, infoHash int160.T, port int, token string, impliedPort bool, rl QueryRateLimiting) (ret QueryResult) {
 	if port == 0 && !impliedPort {
 		ret.Err = errors.New("no port specified")
@@ -1016,6 +1098,30 @@ func (s *Server) GetPeers(ctx context.Context, addr Addr, infoHash int160.T, scr
 			expvars.Add("get_peers responses with empty token", 1)
 		} else {
 			expvars.Add("get_peers responses with token", 1)
+		}
+	}
+	return
+}
+
+func (s *Server) Get(ctx context.Context, addr Addr, target [20]byte, rl QueryRateLimiting) (ret QueryResult) {
+	args := krpc.MsgArgs{
+		Target: target,
+		Want:   []krpc.Want{krpc.WantNodes6, krpc.WantNodes6},
+	}
+
+	ret = s.Query(ctx, addr, "get", QueryInput{
+		MsgArgs:      args,
+		RateLimiting: rl,
+	})
+
+	m := ret.Reply
+	if m.R != nil {
+		if m.R.Token == nil {
+			expvars.Add("get responses with no token", 1)
+		} else if len(*m.R.Token) == 0 {
+			expvars.Add("get responses with empty token", 1)
+		} else {
+			expvars.Add("get responses with token", 1)
 		}
 	}
 	return

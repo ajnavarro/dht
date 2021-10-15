@@ -10,6 +10,7 @@ import (
 	"time"
 
 	peer_store "github.com/anacrolix/dht/v2/peer-store"
+	"github.com/anacrolix/dht/v2/store"
 
 	"github.com/anacrolix/log"
 	"github.com/anacrolix/missinggo/v2"
@@ -59,6 +60,12 @@ type ServerConfig struct {
 	QueryResendDelay func() time.Duration
 	// TODO: Expose Peers, to return NodeInfo for received get_peers queries.
 	PeerStore peer_store.Interface
+	// BEP-44: Storing arbitrary data in the DHT. If not store provided, a default in-memory
+	// implementation will be used.
+	Store store.Store
+
+	//BEP-44: maximum value size for arbitrary dht items. 1000 by default.
+	MaxValueSize int
 
 	// If no Logger is provided, log.Default is used and log.Debug messages are filtered out. Note
 	// that all messages without a log.Level, have log.Debug added to them before being passed to
